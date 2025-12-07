@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Corrida Max 3D - Céu Azul</title>
+  <style>
+    /* fundo com gradiente azul (visível durante carregamento / se canvas não cobrir) */
+    html,body{height:100%;margin:0;background:linear-gradient(#bfe9ff,#87CEEB 50%,#68b0dd 100%);font-family:Arial, Helvetica, sans-serif;overflow:hidden}
+    #gameWrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative}
+    #overlay{position:absolute;left:12px;top:12px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.6);font-weight:700;z-index:4}
+    #rightHud{position:absolute;right:12px;top:12px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.6);font-weight:700;z-index:4}
+    #instr{position:absolute;left:50%;bottom:18px;transform:translateX(-50%);color:#fff;font-weight:700;z-index:4}
+    canvas{display:block}
+    button{position:absolute;top:60px;left:12px;z-index:5}
+    /* pequenas nuvens decorativas em overlay (fallback) */
+    .cloud-overlay{
+      position:absolute;
+      pointer-events:none;
+      z-index:2;
+      width:100%;
+      height:100%;
+      left:0;top:0;
+      mix-blend-mode:screen;
+    }
+  </style>
+</head>
+<body>
+  <div id="gameWrap"></div>
+  <div id="overlay">Pontos: <span id="score">0</span></div>
+  <div id="rightHud">Moedas: <span id="coins">0</span></div>
+  <div id="instr"> ← → = trocar pista • ↑ = pular • ↓ = abaixar/slide • R = reiniciar</div>
+  <button id="toggleCam">Mudar câmera</button>
+
+<script src="https://unpkg.com/three@0.156.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.156.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+/*
+  Corrida Max 3D - versão com céu azul e nuvens simples
+  Mantive a lógica original e acrescentei:
+   - scene.background e fog num azul claro
+   - nuvens simples feitas usando CanvasTexture em planos (movimentam-se lentamente)
+*/
+
+const container = document.getElementById('gameWrap');
+const scene = new THREE.Scene();
+
+// céu / fog (azul claro)
+const SKY_TOP = 0xBFE9FF; // tom mais claro
+const SKY_MID = 0x87CEEB; // tom médio (original)
+const SKY_BOTTOM = 0x68B0DD; // tom inferior
+scene.background = new THREE.Color(SKY_MID);
+scene.fog = new THREE.Fog(new THREE.Color(SKY_MID), 30, 70);
+
+const renderer = new THREE.WebGLRenderer({antialias:true, alpha:false});
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+container.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 400);
+let camMode = 0; // 0 = close, 1 = far
+camera.position.set(0,4,8);
+camera.lookAt(0,1,0);
+
+// Lighting
+const hemi = new THREE.HemisphereLight(SKY_TOP, 0x444444, 0.95);
+hemi.position.set(0, 50, 0);
+scene.add(hemi);
+
+const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+dir.position.set(-5,10,5);
+dir.castShadow = true;
+dir.shadow.camera.left = -40; dir.shadow.camera.right = 40; dir.shadow.camera.top = 40; dir.shadow.camera.bottom = -40;
+scene.add(dir);
+
+// pequeno "sol" (ponto de luz quente)
+const sun = new THREE.PointLight(0xfff1a8, 0.25, 200);
+sun.position.set(-40, 60, -30);
+scene.add(sun);
+
+// Ground (track)
+const groundMat = new THREE.MeshStandardMaterial({color:0x2ecc71});
+const groundGeo = new THREE.PlaneGeometry(60, 120, 1, 1);
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.position.z = 30;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Road stripes and lanes
+const lanes = 3;
+const laneSpacing = 2.8;
+const laneX = [ -laneSpacing, 0, laneSpacing ];
+
+// create subtle strips
+for(let i=0;i<40;i++){
+  const tileGeo = new THREE.BoxGeometry(6,0.02,2.5);
+  const tileMat = new THREE.MeshStandardMaterial({color:0x333333});
+  const tile = new THREE.Mesh(tileGeo, tileMat);
+  tile.position.set(0,0.01, i* -3 + 50);
+  tile.receiveShadow = true;
+  scene.add(tile);
+}
+
+// Player
+const player = {
+  lane:1,
+  mesh: null,
+  width:0.9, height:1.4,
+  vy:0, gravity:-30,
+  jumping:false,
+  sliding:false,
+  slideTimer:0,
+  slideDuration:0.45
+};
+const pGeo = new THREE.BoxGeometry(player.width, player.height, 0.9);
+const pMat = new THREE.MeshStandardMaterial({color:0xff4757});
+player.mesh = new THREE.Mesh(pGeo, pMat);
+player.mesh.castShadow = true;
+player.mesh.position.set(laneX[player.lane], player.height/2, 0);
+scene.add(player.mesh);
+
+// obstacles & coins arrays
+let obstacles = [];
+let coins = [];
+
+let spawnTimer = 0;
+let spawnInterval = 1.1; // seconds
+let clock = new THREE.Clock();
+
+let gameSpeed = 6; // units per second
+let distance = 0;
+let score = 0;
+let coinCount = 0;
+let running = true;
+
+/* --- NUVENS SIMPLES --- 
+   cria uma textura de nuvem usando canvas e aplica em um PlaneGeometry.
+   adicionamos várias nuvens que se movem levemente pela cena (no céu).
+*/
+function createCloudTexture(){
+  const size = 256;
+  const cv = document.createElement('canvas');
+  cv.width = size; cv.height = size;
+  const ctx = cv.getContext('2d');
+  // fundo transparente
+  ctx.clearRect(0,0,size,size);
+  // desenhar círculos brancos suaves para formar nuvem
+  const grd = ctx.createRadialGradient(128,128,10,128,128,120);
+  grd.addColorStop(0, 'rgba(255,255,255,0.95)');
+  grd.addColorStop(0.5, 'rgba(255,255,255,0.8)');
+  grd.addColorStop(1, 'rgba(255,255,255,0.0)');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0,0,size,size);
+
+  // adicionar formas brancas extras para dar volume
+  ctx.globalCompositeOperation = 'lighter';
+  for(let i=0;i<6;i++){
+    const x = 40 + Math.random()*176;
+    const y = 40 + Math.random()*176;
+    const r = 30 + Math.random()*60;
+    ctx.beginPath();
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.5 + Math.random()*0.5) + ')';
+    ctx.arc(x,y,r,0,Math.PI*2);
+    ctx.fill();
+  }
+  return new THREE.CanvasTexture(cv);
+}
+
+// criar várias nuvens
+const clouds = [];
+const cloudTex = createCloudTexture();
+function makeCloud(scale=1){
+  const mat = new THREE.MeshBasicMaterial({map: cloudTex, transparent:true, depthWrite:false, opacity:0.95});
+  const geo = new THREE.PlaneGeometry(12*scale, 8*scale);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.rotation.y = Math.PI/8; // leve inclinação
+  mesh.renderOrder = 0;
+  mesh.position.set((Math.random()-0.5)*60, 18 + Math.random()*6, -20 + Math.random()*80);
+  mesh.material.opacity = 0.9 - Math.random()*0.3;
+  mesh.scale.set(1,1,1);
+  scene.add(mesh);
+  return mesh;
+}
+
+// gerar nuvens iniciais
+for(let i=0;i<10;i++){
+  clouds.push(makeCloud(0.6 + Math.random()*1.6));
+}
+
+/* --- FIM NUVENS --- */
+
+// Helpers (obstacle/coin creators)
+function makeObstacle(type=0){
+  const h = type===1 ? 1.6 : 1.0;
+  const g = new THREE.BoxGeometry(1.2, h, 1.2);
+  const m = new THREE.MeshStandardMaterial({color:0x2f3542});
+  const mesh = new THREE.Mesh(g,m);
+  mesh.castShadow = true;
+  const lane = Math.floor(Math.random()*lanes);
+  mesh.position.set(laneX[lane], h/2, 40);
+  scene.add(mesh);
+  return {mesh, lane, width:1.2, height:h, passed:false};
+}
+function makeCoin(){
+  const g = new THREE.SphereGeometry(0.35,12,12);
+  const m = new THREE.MeshStandardMaterial({color:0xf1c40f, metalness:0.6, roughness:0.3});
+  const mesh = new THREE.Mesh(g,m);
+  mesh.castShadow = true;
+  const lane = Math.floor(Math.random()*lanes);
+  mesh.position.set(laneX[lane], 1.0, 40);
+  scene.add(mesh);
+  return {mesh, lane, collected:false};
+}
+
+// Input
+const keys = {};
+window.addEventListener('keydown', e=>{ keys[e.key.toLowerCase()]=true; handleKey(e.key.toLowerCase()); });
+window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()]=false; });
+
+function handleKey(k){
+  if(!running) return;
+  if(k === 'arrowleft' || k === 'a'){ if(player.lane>0){ player.lane--; } }
+  if(k === 'arrowright' || k === 'd'){ if(player.lane<lanes-1){ player.lane++; } }
+  if(k === 'arrowup' || k === 'w'){ tryJump(); }
+  if(k === 'arrowdown' || k === 's'){ startSlide(); }
+}
+
+function tryJump(){
+  if(!player.jumping && !player.sliding){
+    player.vy = 10; player.jumping = true;
+  }
+}
+function startSlide(){
+  if(!player.jumping && !player.sliding){
+    player.sliding = true; player.slideTimer = 0;
+    player.mesh.scale.y = 0.6;
+    player.mesh.position.y = player.height * 0.6 / 2;
+  }
+}
+
+// Touch controls (simple)
+let tStartY = null, tStartX = null;
+renderer.domElement.addEventListener('touchstart', e=>{
+  const t = e.touches[0];
+  tStartY = t.clientY; tStartX = t.clientX;
+});
+renderer.domElement.addEventListener('touchend', e=>{
+  const t = e.changedTouches[0];
+  const dy = tStartY - t.clientY, dx = tStartX - t.clientX;
+  if(Math.abs(dy) > 40 && Math.abs(dy) > Math.abs(dx)){
+    if(dy > 0) tryJump(); else startSlide();
+  } else {
+    const rect = renderer.domElement.getBoundingClientRect();
+    const x = t.clientX - rect.left;
+    if(x > rect.width/2) { if(player.lane<lanes-1) player.lane++; }
+    else { if(player.lane>0) player.lane--; }
+  }
+});
+
+// Game loop
+function update(dt){
+  if(!running) return;
+
+  // speed increases slowly
+  gameSpeed += dt * 0.02;
+
+  // spawn
+  spawnTimer += dt;
+  if(spawnTimer > spawnInterval){
+    spawnTimer = 0;
+    if(Math.random() < 0.7) obstacles.push(makeObstacle(Math.random()<0.25?1:0));
+    if(Math.random() < 0.5) coins.push(makeCoin());
+    spawnInterval = Math.max(0.5, spawnInterval - 0.005);
+  }
+
+  // update player vertical movement
+  if(player.jumping){
+    player.vy += player.gravity ? player.gravity * dt : -30 * dt;
+    player.mesh.position.y += player.vy * dt;
+    if(player.mesh.position.y <= player.height/2){
+      player.mesh.position.y = player.height/2;
+      player.jumping = false; player.vy = 0;
+    }
+  } else {
+    if(!player.sliding){
+      player.mesh.position.y = player.height/2;
+      player.mesh.scale.y = 1;
+    }
+  }
+
+  if(player.sliding){
+    player.slideTimer += dt;
+    if(player.slideTimer > player.slideDuration){
+      player.sliding = false;
+      player.mesh.scale.y = 1;
+      player.mesh.position.y = player.height/2;
+    }
+  }
+
+  // smooth lane movement
+  const targetX = laneX[player.lane];
+  player.mesh.position.x += (targetX - player.mesh.position.x) * Math.min(1, 10*dt);
+
+  // move obstacles/coins towards camera
+  const moveZ = gameSpeed * dt;
+  for(let i=obstacles.length-1;i>=0;i--){
+    const o = obstacles[i];
+    o.mesh.position.z -= moveZ;
+    if(o.mesh.position.z < -5){
+      scene.remove(o.mesh); obstacles.splice(i,1); continue;
+    }
+    // collision with player (simple AABB)
+    if(Math.abs(o.mesh.position.z - player.mesh.position.z) < 1.2 && o.lane === player.lane){
+      if(!(player.sliding && o.height > 1.2)){
+        endGame();
+      }
+    }
+  }
+  for(let i=coins.length-1;i>=0;i--){
+    const c = coins[i];
+    c.mesh.position.z -= moveZ;
+    c.mesh.rotation.y += 5 * dt;
+    if(c.mesh.position.z < -5){ scene.remove(c.mesh); coins.splice(i,1); continue; }
+    if(Math.abs(c.mesh.position.z - player.mesh.position.z) < 1.0 && c.lane === player.lane){
+      coinCount++; document.getElementById('coins').innerText = coinCount;
+      scene.remove(c.mesh); coins.splice(i,1);
+    }
+  }
+
+  // scoring by distance
+  distance += gameSpeed * dt;
+  score = Math.floor(distance);
+  document.getElementById('score').innerText = score;
+
+  // atualizar movimentação das nuvens: deslocamento lento em x e z
+  for(let i=0;i<clouds.length;i++){
+    const c = clouds[i];
+    c.position.x += Math.sin((performance.now()*0.0001)+i) * dt * 0.4; // leve oscilação
+    c.position.z -= dt * 0.8; // velocidade constante em -z, repetimos quando muito atrás
+    if(c.position.z < -30) c.position.z = 80 + Math.random()*30;
+    if(c.position.x > 40) c.position.x = -40;
+    if(c.position.x < -40) c.position.x = 40;
+  }
+}
+
+function endGame(){
+  running = false;
+  const overlay = document.createElement('div');
+  overlay.style.position = 'absolute';
+  overlay.style.left = '0';
+  overlay.style.top = '0';
+  overlay.style.width = '100%';
+  overlay.style.height = '100%';
+  overlay.style.display = 'flex';
+  overlay.style.alignItems = 'center';
+  overlay.style.justifyContent = 'center';
+  overlay.style.background = 'rgba(0,0,0,0.5)';
+  overlay.style.color = '#fff';
+  overlay.style.fontSize = '28px';
+  overlay.style.zIndex = 10;
+  overlay.innerHTML = '<div>Game Over<br><small>Pressione R para reiniciar</small></div>';
+  document.body.appendChild(overlay);
+  window.addEventListener('keydown', function onR(e){
+    if(e.key.toLowerCase() === 'r'){
+      window.removeEventListener('keydown', onR);
+      location.reload();
+    }
+  });
+}
+
+// animation
+function animate(){
+  const dt = clock.getDelta();
+  update(dt);
+  // camera follow
+  if(camMode===0){
+    camera.position.lerp(new THREE.Vector3(player.mesh.position.x, player.mesh.position.y + 2.5, player.mesh.position.z + 8), 0.08);
+    camera.lookAt(player.mesh.position.x, player.mesh.position.y + 0.8, player.mesh.position.z);
+  } else {
+    camera.position.lerp(new THREE.Vector3(0,12,28), 0.06);
+    camera.lookAt(0,0,0);
+  }
+  renderer.render(scene, camera);
+  if(running) requestAnimationFrame(animate);
+}
+animate();
+
+// window resize
+window.addEventListener('resize', ()=>{ renderer.setSize(window.innerWidth, window.innerHeight); camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); });
+
+// quick controls
+document.getElementById('toggleCam').addEventListener('click', ()=>{ camMode = 1-camMode; });
+
+// restart with R when game over (also allowed)
+window.addEventListener('keydown', e=>{ if(!running && (e.key==='r' || e.key==='R')) location.reload(); });
+
+// initialize starting obstacles a bit forward
+for(let i=0;i<4;i++){ if(Math.random()<0.6) obstacles.push(makeObstacle()); if(Math.random()<0.4) coins.push(makeCoin()); }
+
+</script>
+</body>
+</html>
