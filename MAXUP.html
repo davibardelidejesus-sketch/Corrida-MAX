@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>MAX UP</title>
+<style>
+  html,body{height:100%;margin:0;background:#071421;overflow:hidden;font-family:Inter,Arial,sans-serif}
+  #container{width:100%;height:100%;display:flex;align-items:center;justify-content:center}
+  canvas{display:block}
+  .hud{
+    position:fixed;left:12px;top:12px;color:#fff;background:rgba(0,0,0,0.35);padding:8px 12px;border-radius:10px;font-weight:700;backdrop-filter: blur(4px)
+  }
+  .controls{position:fixed;right:12px;top:12px;color:#fff;background:rgba(0,0,0,0.35);padding:8px 12px;border-radius:10px}
+  .btns{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;display:flex;gap:12px}
+  .touchbtn{width:64px;height:54px;border-radius:10px;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;user-select:none}
+</style>
+</head>
+<body>
+<div id="container"></div>
+<div class="hud">Score: <span id="score">0</span> &nbsp; Best: <span id="best">0</span></div>
+<div class="controls">←/→ mover • Espaço pular • S deslizar</div>
+<div class="btns">
+  <div class="touchbtn" id="leftBtn">◀</div>
+  <div class="touchbtn" id="jumpBtn">▲</div>
+  <div class="touchbtn" id="rightBtn">▶</div>
+</div>
+
+<!-- Three.js from CDN -->
+<script src="https://unpkg.com/three@0.152.2/build/three.min.js"></script>
+
+<script>
+/*
+  Runner 3D - simple endless runner using Three.js
+  - 3 lanes (left, center, right)
+  - player is a cube, obstacles are boxes
+  - obstacles spawn ahead and move towards the player
+  - controls: left/right (A/D or arrows), space to jump, S or ArrowDown to slide
+  - responsive canvas
+*/
+
+const container = document.getElementById('container');
+const scoreEl = document.getElementById('score');
+const bestEl = document.getElementById('best');
+
+let best = Number(localStorage.getItem('runner3d_best') || 0);
+bestEl.textContent = best;
+
+let scene, camera, renderer;
+let player, lanes = [-3.2, 0, 3.2];
+let currentLane = 1;
+let obstacles = [];
+let clock = new THREE.Clock();
+let spawnTimer = 0;
+let speed = 12; // world speed - how fast obstacles approach
+let running = true;
+let score = 0;
+
+// init three
+function init(){
+  scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x071421, 0.01);
+
+  const aspect = window.innerWidth / window.innerHeight;
+  camera = new THREE.PerspectiveCamera(50, aspect, 0.1, 1000);
+  camera.position.set(0, 6, 12);
+  camera.lookAt(0,1,0);
+
+  renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setPixelRatio(window.devicePixelRatio ? Math.min(window.devicePixelRatio,2) : 1);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  container.appendChild(renderer.domElement);
+
+  // lights
+  const hemi = new THREE.HemisphereLight(0x9fbbe6, 0x101217, 0.9);
+  scene.add(hemi);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.6);
+  dir.position.set(5,10,7);
+  scene.add(dir);
+
+  // ground - long plane with repeating stripes
+  const groundGeo = new THREE.PlaneGeometry(40, 2000, 1, 1);
+  const groundMat = new THREE.MeshStandardMaterial({color:0x0b2333});
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.rotation.x = -Math.PI/2;
+  ground.position.z = -800; // center towards far so we can move obstacles
+  scene.add(ground);
+
+  // lane markers
+  const markMat = new THREE.MeshBasicMaterial({color:0x154042, transparent:true, opacity:0.6});
+  for(let i=-1;i<=1;i++){
+    const m = new THREE.Mesh(new THREE.BoxGeometry(2.8, 0.05, 2000), markMat);
+    m.position.set(lanes[i+1], 0.01, -700);
+    scene.add(m);
+  }
+
+  // player
+  const pMat = new THREE.MeshStandardMaterial({color:0xffd24d});
+  const body = new THREE.Mesh(new THREE.BoxGeometry(1.6,2.4,1.2), pMat);
+  const head = new THREE.Mesh(new THREE.BoxGeometry(1.4,0.9,1), new THREE.MeshStandardMaterial({color:0xfff1c9}));
+  head.position.y = 1.7;
+  player = new THREE.Group();
+  player.add(body);
+  player.add(head);
+  player.position.set(lanes[1], 1.2, 0);
+  scene.add(player);
+
+  // decorative rails / walls at sides
+  const sideMat = new THREE.MeshStandardMaterial({color:0x8a2b2b});
+  const leftWall = new THREE.Mesh(new THREE.BoxGeometry(2,2,2000), sideMat);
+  leftWall.position.set(-10,1,-700);
+  scene.add(leftWall);
+  const rightWall = leftWall.clone();
+  rightWall.position.set(10,1,-700);
+  scene.add(rightWall);
+
+  // ambient obstacles (initial)
+  for(let i=0;i<6;i++) spawnObstacle( - (50 + i*40));
+
+  // event listeners
+  window.addEventListener('resize', onResize);
+  window.addEventListener('keydown', onKey);
+  // touch buttons
+  document.getElementById('leftBtn').addEventListener('touchstart', (e)=>{ e.preventDefault(); moveLeft(); });
+  document.getElementById('rightBtn').addEventListener('touchstart', (e)=>{ e.preventDefault(); moveRight(); });
+  document.getElementById('jumpBtn').addEventListener('touchstart', (e)=>{ e.preventDefault(); doJump(); });
+
+  // swipe on screen
+  let ts = null;
+  renderer.domElement.addEventListener('touchstart', (e)=>{ ts = e.touches[0]; });
+  renderer.domElement.addEventListener('touchend', (e)=>{ 
+    if(!ts) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - ts.clientX;
+    const dy = t.clientY - ts.clientY;
+    if(Math.abs(dx) > Math.abs(dy)){
+      if(dx > 40) moveRight(); else if(dx < -40) moveLeft();
+    } else {
+      if(dy < -40) doJump(); else if(dy > 40) doSlide();
+    }
+    ts = null;
+  });
+
+  animate();
+}
+
+function onResize(){
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function onKey(e){
+  if(e.code === 'ArrowLeft' || e.key.toLowerCase() === 'a') moveLeft();
+  if(e.code === 'ArrowRight' || e.key.toLowerCase() === 'd') moveRight();
+  if(e.code === 'Space') doJump();
+  if(e.key.toLowerCase() === 's' || e.code === 'ArrowDown') doSlide();
+}
+
+function moveLeft(){ if(!running) return; if(currentLane>0){ currentLane--; tweenLane(); } }
+function moveRight(){ if(!running) return; if(currentLane<2){ currentLane++; tweenLane(); } }
+
+let laneLerp = null;
+function tweenLane(){
+  const targetX = lanes[currentLane];
+  const startX = player.position.x;
+  const duration = 0.12; // seconds
+  laneLerp = {t:0, startX, targetX, duration};
+}
+
+let playerState = { vy:0, onGround:true, sliding:false, slideTimer:0 };
+
+function doJump(){
+  if(!running) return;
+  if(playerState.onGround && !playerState.sliding){
+    playerState.vy = 8.6;
+    playerState.onGround = false;
+  }
+}
+
+function doSlide(){
+  if(!running) return;
+  if(playerState.onGround && !playerState.sliding){
+    playerState.sliding = true;
+    playerState.slideTimer = 0.45; // seconds
+    // shrink body visually
+    player.children[0].scale.y = 0.5;
+    player.children[0].position.y = -0.5;
+  }
+}
+
+function spawnObstacle(offsetZ){
+  // offsetZ optional: if provided place further ahead
+  const lane = Math.floor(Math.random()*3);
+  const w = (Math.random() < 0.25) ? 2.4 : 1.8;
+  const h = (Math.random() < 0.25) ? 3.2 : (1.2 + Math.random()*1.6);
+  const geo = new THREE.BoxGeometry(w, h, 1.8);
+  const mat = new THREE.MeshStandardMaterial({color:0xc43b2b});
+  const m = new THREE.Mesh(geo, mat);
+  const z = (typeof offsetZ === 'number') ? offsetZ : -120 - Math.random()*80;
+  m.position.set(lanes[lane], h/2, z);
+  m.userData = {lane};
+  scene.add(m);
+  obstacles.push(m);
+}
+
+function animate(){
+  const dt = Math.min(0.05, clock.getDelta());
+  if(running){
+    updateGame(dt);
+  }
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+
+function updateGame(dt){
+  // move lane tween
+  if(laneLerp){
+    laneLerp.t += dt;
+    const k = Math.min(1, laneLerp.t / laneLerp.duration);
+    // ease
+    const ease = k<0.5 ? 2*k*k : -1 + (4-2*k)*k;
+    player.position.x = laneLerp.startX + (laneLerp.targetX - laneLerp.startX) * ease;
+    if(k >= 1) laneLerp = null;
+  } else {
+    // ensure exact
+    player.position.x = lanes[currentLane];
+  }
+
+  // player vertical physics
+  if(!playerState.onGround){
+    playerState.vy -= 20 * dt; // gravity
+    player.position.y += playerState.vy * dt;
+    if(player.position.y <= 1.2){
+      player.position.y = 1.2;
+      playerState.onGround = true;
+      playerState.vy = 0;
+    }
+  }
+
+  // sliding timer
+  if(playerState.sliding){
+    playerState.slideTimer -= dt;
+    if(playerState.slideTimer <= 0){
+      playerState.sliding = false;
+      player.children[0].scale.y = 1;
+      player.children[0].position.y = 0;
+    }
+  }
+
+  // move obstacles forward (towards camera/player)
+  for(let i=obstacles.length-1;i>=0;i--){
+    const o = obstacles[i];
+    o.position.z += speed * dt;
+    // small bobbing
+    o.rotation.y += dt * 0.6;
+    // passed player
+    if(o.position.z > 10){
+      // remove
+      scene.remove(o);
+      obstacles.splice(i,1);
+      score += 10;
+      scoreEl.textContent = score;
+      if(score > best){ best = score; bestEl.textContent = best; localStorage.setItem('runner3d_best', String(best)); }
+    } else {
+      // collision check
+      if(Math.abs(o.position.z - player.position.z) < 1.2){
+        if(Math.abs(o.position.x - player.position.x) < 1.4){
+          // check height overlap
+          const oTop = o.position.y + (o.geometry.parameters.height/2 || 1);
+          const pBottom = player.position.y - 1.2*(player.children[0].scale.y);
+          if(oTop > pBottom + 0.2){
+            // collision
+            running = false;
+            showGameOver();
+          }
+        }
+      }
+    }
+  }
+
+  // spawn new obstacles
+  spawnTimer += dt;
+  const spawnInterval = Math.max(0.35, 0.9 - Math.min(0.5, score/400));
+  if(spawnTimer > spawnInterval){
+    spawnTimer = 0;
+    // spawn 1-2 obstacles in sequence
+    if(Math.random() < 0.2){
+      spawnObstacle(-200 - Math.random()*60);
+    } else {
+      spawnObstacle(-140 - Math.random()*80);
+    }
+  }
+
+  // slowly increase speed
+  speed += 0.003 * dt * Math.max(1, score/100);
+}
+
+// game over
+function showGameOver(){
+  // flash and stop
+  const div = document.createElement('div');
+  div.style.position = 'fixed';
+  div.style.left = '50%';
+  div.style.top = '40%';
+  div.style.transform = 'translate(-50%,-50%)';
+  div.style.background = 'rgba(0,0,0,0.6)';
+  div.style.color = '#fff';
+  div.style.padding = '18px 26px';
+  div.style.borderRadius = '12px';
+  div.style.fontWeight = '800';
+  div.style.textAlign = 'center';
+  div.innerHTML = 'VOCÊ BATEU!<br><small style="font-weight:600">Toque para reiniciar</small>';
+  document.body.appendChild(div);
+
+  function restartHandler(){
+    document.body.removeChild(div);
+    // cleanup obstacles
+    for(let o of obstacles) scene.remove(o);
+    obstacles = [];
+    currentLane = 1;
+    player.position.set(lanes[1], 1.2, 0);
+    playerState = { vy:0, onGround:true, sliding:false, slideTimer:0 };
+    speed = 12;
+    score = 0;
+    scoreEl.textContent = score;
+    running = true;
+    // spawn a few initial obstacles
+    for(let i=0;i<6;i++) spawnObstacle(- (50 + i*40));
+    window.removeEventListener('pointerdown', restartHandler);
+  }
+  window.addEventListener('pointerdown', restartHandler);
+}
+
+// start
+init();
+
+</script>
+</body>
+</html>
